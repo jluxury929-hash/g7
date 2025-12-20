@@ -1,5 +1,5 @@
 // ===============================================================================
-// APEX UNIFIED MASTER v12.8.5 (BIG-FISH EDITION: NITRO SPEED + GAS SAVER)
+// APEX UNIFIED MASTER v12.8.6 (BIG-FISH EDITION: NITRO SPEED + WETH TRACKING)
 // ===============================================================================
 
 require('dotenv').config();
@@ -14,7 +14,7 @@ app.use(express.json());
 // 1. CONFIGURATION
 const PORT = process.env.PORT || 8080;
 const PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
-const CONTRACT_ADDR = "0x83EF5c401fAa5B9674BAfAcFb089b30bAc67C9A0";
+const CONTRACT_ADDR = "0x83EF5c401fAa5B9674BAfAcFb089b30bAc67C9A0"; // Your Smart Contract
 const SCANNER_BASE = "https://basescan.org/tx/";
 
 // --- NITRO PROFIT SLIDERS ---
@@ -35,36 +35,41 @@ const TOKENS = {
     DEGEN: "0x4edbc9ba171790664872997239bc7a3f3a633190" 
 };
 
+// ABI updated to include balanceOf for WETH monitoring
 const ABI = [
     "function executeFlashArbitrage(address tokenA, address tokenOut, uint256 amount) external",
     "function getContractBalance() external view returns (uint256)",
-    "function withdraw() external"
+    "function withdraw() external",
+    "function balanceOf(address account) external view returns (uint256)"
 ];
 
 let provider, signer, flashContract, transactionNonce, currentGasBalance;
 
-// 2. STABILIZED BOOT
+// 2. STABILIZED BOOT (FIXED BATCH LIMITS)
 async function init() {
     console.log("-----------------------------------------");
-    console.log("🐋 APEX v12.8.5: BIG-FISH GAS SAVER ACTIVE");
-    const network = ethers.Network.from(8453); 
+    console.log("🐋 APEX v12.8.6: BIG-FISH + WETH MONITOR");
+    const network = ethers.Network.from(8453); // Base Mainnet
 
     try {
         const configs = RPC_POOL.map((url, i) => ({
-            provider: new ethers.JsonRpcProvider(url, network, { staticNetwork: true }),
+            // batchMaxCount: 1 fixes the "maximum 10 calls in 1 batch" error
+            provider: new ethers.JsonRpcProvider(url, network, { 
+                staticNetwork: true,
+                batchMaxCount: 1 
+            }),
             priority: i === 0 ? 1 : 2,
-            stallTimeout: 2000
+            stallTimeout: 2500
         }));
 
         provider = new ethers.FallbackProvider(configs, network, { quorum: 1 });
         signer = new ethers.Wallet(PRIVATE_KEY, provider);
         flashContract = new ethers.Contract(CONTRACT_ADDR, ABI, signer);
         
-        const block = await provider.getBlockNumber();
         currentGasBalance = await provider.getBalance(signer.address);
         transactionNonce = await provider.getTransactionCount(signer.address, 'pending');
 
-        console.log(`✅ [CONNECTED] Block: ${block}`);
+        console.log(`✅ [CONNECTED] Block: Synced`);
         console.log(`[WALLET] Gas: ${ethers.formatEther(currentGasBalance).substring(0, 7)} ETH`);
         console.log(`🎯 [TARGET] Min Whale: ${MIN_WHALE_SIZE} ETH`);
         console.log("-----------------------------------------");
@@ -74,12 +79,12 @@ async function init() {
     }
 }
 
-// 3. NITRO STRIKE ENGINE (WITH SAFEGUARDS)
+// 3. NITRO STRIKE ENGINE (OPTIMIZED GAS)
 function executeApexStrike(targetTx) {
-    // A. WHALE FILTER: Skip small trades to save gas
+    // A. WHALE FILTER: Only swing at real opportunities
     if (!targetTx || !targetTx.value || targetTx.value < ethers.parseEther(MIN_WHALE_SIZE)) return;
 
-    // B. GAS SAFEGUARD: Protect remaining balance
+    // B. GAS SAFEGUARD: Protect your remaining gas
     if (currentGasBalance < ethers.parseEther(CRITICAL_GAS_LIMIT)) {
         console.log("🛑 [SYSTEM PAUSED] Gas below critical limit. Refill required.");
         return;
@@ -94,9 +99,9 @@ function executeApexStrike(targetTx) {
         TOKENS.DEGEN, 
         ethers.parseEther("100"), 
         {
-            gasLimit: 850000,
-            maxPriorityFeePerGas: ethers.parseUnits("0.15", "gwei"),
-            maxFeePerGas: ethers.parseUnits("0.30", "gwei"),
+            gasLimit: 750000, 
+            maxPriorityFeePerGas: ethers.parseUnits("0.1", "gwei"),
+            maxFeePerGas: ethers.parseUnits("0.2", "gwei"),
             nonce: transactionNonce++,
             type: 2
         }
@@ -109,7 +114,7 @@ function executeApexStrike(targetTx) {
             if (receipt.status === 1) {
                 console.log(`✅ [SUCCESS] Tx mined in block ${receipt.blockNumber}`);
             } else {
-                console.log(`⚠️  [REVERT] Competition won the race.`);
+                console.log(`⚠️  [REVERT] Competition won the race / No profit found.`);
             }
         }).catch(() => {});
 
@@ -120,10 +125,11 @@ function executeApexStrike(targetTx) {
     });
 }
 
-// 4. SCANNER & MONITOR
+// 4. SCANNER & PROFIT MONITOR
 function startScanning() {
     console.log(`🔍 SNIFFER LIVE: ${WSS_URL.substring(0, 30)}...`);
     const wssProvider = new ethers.WebSocketProvider(WSS_URL);
+    const wethContract = new ethers.Contract(TOKENS.WETH, ABI, provider);
     
     wssProvider.on("pending", (h) => {
         provider.getTransaction(h).then(tx => {
@@ -131,15 +137,24 @@ function startScanning() {
         }).catch(() => {});
     });
 
+    // Heartbeat every 45 seconds to update logs
     setInterval(async () => {
         try {
             currentGasBalance = await provider.getBalance(signer.address);
-            const earnings = await flashContract.getContractBalance().catch(() => 0n);
-            console.log(`[HEARTBEAT] Gas: ${ethers.formatEther(currentGasBalance).substring(0,6)} | Earned: ${ethers.formatEther(earnings)} | Nonce: ${transactionNonce}`);
-        } catch (e) {}
+            
+            // Checks for WETH profit stored in the contract
+            const wethBal = await wethContract.balanceOf(CONTRACT_ADDR).catch(() => 0n);
+            
+            console.log(`[HEARTBEAT] Gas: ${ethers.formatEther(currentGasBalance).substring(0,6)} | Earned (WETH): ${ethers.formatEther(wethBal).substring(0,7)} | Nonce: ${transactionNonce}`);
+        } catch (e) {
+            console.log("⚠️ Heartbeat lag... still hunting.");
+        }
     }, 45000);
 
-    wssProvider.websocket.on("close", () => setTimeout(startScanning, 2000));
+    wssProvider.websocket.on("close", () => {
+        console.log("🔄 Reconnecting Sniffer...");
+        setTimeout(startScanning, 2000);
+    });
 }
 
 // 5. WITHDRAWAL & STATUS
@@ -152,9 +167,16 @@ app.post(`/withdraw/standard-eoa`, async (req, res) => {
 });
 
 app.get('/status', async (req, res) => {
-    const bal = await provider.getBalance(signer.address).catch(() => 0n);
-    const earnings = await flashContract.getContractBalance().catch(() => 0n);
-    res.json({ status: "HUNTING", gas: ethers.formatEther(bal), earned: ethers.formatEther(earnings) });
+    try {
+        const bal = await provider.getBalance(signer.address);
+        const wethContract = new ethers.Contract(TOKENS.WETH, ABI, provider);
+        const wethBal = await wethContract.balanceOf(CONTRACT_ADDR);
+        res.json({ 
+            status: "HUNTING", 
+            gas_eth: ethers.formatEther(bal), 
+            contract_weth: ethers.formatEther(wethBal) 
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 init().then(() => {
