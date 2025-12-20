@@ -1,11 +1,12 @@
 // ===============================================================================
-// APEX UNIFIED MASTER v12.8.6 (BIG-FISH EDITION: NITRO SPEED + WETH TRACKING)
+// APEX UNIFIED MASTER v12.9.0 (NITRO-PROFIT + BIG-FISH EVOLUTION)
 // ===============================================================================
 
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { ethers } = require('ethers');
+const WebSocket = require('ws'); // Added for Raw WebSocket Speed
 
 const app = express();
 app.use(cors());
@@ -14,12 +15,14 @@ app.use(express.json());
 // 1. CONFIGURATION
 const PORT = process.env.PORT || 8080;
 const PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
-const CONTRACT_ADDR = "0x83EF5c401fAa5B9674BAfAcFb089b30bAc67C9A0"; // Your Smart Contract
+const CONTRACT_ADDR = "0x83EF5c401fAa5B9674BAfAcFb089b30bAc67C9A0";
 const SCANNER_BASE = "https://basescan.org/tx/";
 
-// --- NITRO PROFIT SLIDERS ---
-const MIN_WHALE_SIZE = "0.5";       // Only strike if whale trade is > 0.5 ETH
-const CRITICAL_GAS_LIMIT = "0.001"; // STOP firing if wallet drops below 0.001 ETH
+// --- NITRO PROFIT MATH ---
+const MIN_WHALE_SIZE = "1.0";       // MATH FIX: Only strike > 1.0 ETH for slippage gap
+const CRITICAL_GAS_LIMIT = "0.001"; // STOP firing if wallet drops below this
+const BASE_FLASH_LOAN = "250";      // Starting attack size
+const MAX_FLASH_LOAN = "1200";      // Max ceiling for mega-whales
 // ----------------------------
 
 const RPC_POOL = [
@@ -35,25 +38,22 @@ const TOKENS = {
     DEGEN: "0x4edbc9ba171790664872997239bc7a3f3a633190" 
 };
 
-// ABI updated to include balanceOf for WETH monitoring
 const ABI = [
     "function executeFlashArbitrage(address tokenA, address tokenOut, uint256 amount) external",
-    "function getContractBalance() external view returns (uint256)",
     "function withdraw() external",
     "function balanceOf(address account) external view returns (uint256)"
 ];
 
 let provider, signer, flashContract, transactionNonce, currentGasBalance;
 
-// 2. STABILIZED BOOT (FIXED BATCH LIMITS)
+// 2. STABILIZED BOOT (FIXED BATCH LIMITS + FAILOVER)
 async function init() {
     console.log("-----------------------------------------");
-    console.log("🐋 APEX v12.8.6: BIG-FISH + WETH MONITOR");
-    const network = ethers.Network.from(8453); // Base Mainnet
+    console.log("🚀 APEX v12.9.0: NITRO-PROFIT ONLINE");
+    const network = ethers.Network.from(8453); 
 
     try {
         const configs = RPC_POOL.map((url, i) => ({
-            // batchMaxCount: 1 fixes the "maximum 10 calls in 1 batch" error
             provider: new ethers.JsonRpcProvider(url, network, { 
                 staticNetwork: true,
                 batchMaxCount: 1 
@@ -71,7 +71,7 @@ async function init() {
 
         console.log(`✅ [CONNECTED] Block: Synced`);
         console.log(`[WALLET] Gas: ${ethers.formatEther(currentGasBalance).substring(0, 7)} ETH`);
-        console.log(`🎯 [TARGET] Min Whale: ${MIN_WHALE_SIZE} ETH`);
+        console.log(`🎯 [TARGET] Whale: >1.0 ETH | Dynamic Loan: 250-1200 WETH`);
         console.log("-----------------------------------------");
     } catch (e) {
         console.error(`❌ [BOOT ERROR] ${e.message}`);
@@ -79,81 +79,94 @@ async function init() {
     }
 }
 
-// 3. NITRO STRIKE ENGINE (OPTIMIZED GAS)
-function executeApexStrike(targetTx) {
-    // A. WHALE FILTER: Only swing at real opportunities
-    if (!targetTx || !targetTx.value || targetTx.value < ethers.parseEther(MIN_WHALE_SIZE)) return;
+// 3. NITRO STRIKE ENGINE (DYNAMIC ATTACK + SPEED)
+async function executeApexStrike(txHash) {
+    try {
+        // Fetch full tx details from hash provided by WebSocket
+        const targetTx = await provider.getTransaction(txHash);
+        
+        // A. PROFIT FILTER: Only swing at > 1.0 ETH whales
+        if (!targetTx || !targetTx.value || targetTx.value < ethers.parseEther(MIN_WHALE_SIZE)) return;
+        if (currentGasBalance < ethers.parseEther(CRITICAL_GAS_LIMIT)) return;
 
-    // B. GAS SAFEGUARD: Protect your remaining gas
-    if (currentGasBalance < ethers.parseEther(CRITICAL_GAS_LIMIT)) {
-        console.log("🛑 [SYSTEM PAUSED] Gas below critical limit. Refill required.");
-        return;
-    }
+        const startTime = Date.now();
+        const whaleVal = parseFloat(ethers.formatEther(targetTx.value));
+        
+        // B. MATH FIX: Scale attack based on whale size (Bigger whale = Bigger loan)
+        let loanAmount = BASE_FLASH_LOAN; 
+        if (whaleVal > 3.0) loanAmount = "600"; 
+        if (whaleVal > 10.0) loanAmount = MAX_FLASH_LOAN;
 
-    const startTime = Date.now();
-    const whaleVal = ethers.formatEther(targetTx.value).substring(0, 6);
-
-    // FIRE-AND-FORGET
-    flashContract.executeFlashArbitrage(
-        TOKENS.WETH, 
-        TOKENS.DEGEN, 
-        ethers.parseEther("100"), 
-        {
-            gasLimit: 750000, 
-            maxPriorityFeePerGas: ethers.parseUnits("0.1", "gwei"),
-            maxFeePerGas: ethers.parseUnits("0.2", "gwei"),
-            nonce: transactionNonce++,
-            type: 2
-        }
-    ).then(tx => {
-        const latency = Date.now() - startTime;
-        console.log(`\n🚀 [BIG FISH STRIKE] Whale: ${whaleVal} ETH | Latency: ${latency}ms`);
-        console.log(`🔗 [VIEW TX] ${SCANNER_BASE}${tx.hash}`);
-
-        tx.wait(1).then(receipt => {
-            if (receipt.status === 1) {
-                console.log(`✅ [SUCCESS] Tx mined in block ${receipt.blockNumber}`);
-            } else {
-                console.log(`⚠️  [REVERT] Competition won the race / No profit found.`);
+        // C. NITRO SPEED: High-Priority Gas Bid (Dec 2025 Standard)
+        flashContract.executeFlashArbitrage(
+            TOKENS.WETH, 
+            TOKENS.DEGEN, 
+            ethers.parseEther(loanAmount.toString()), 
+            {
+                gasLimit: 850000,
+                maxPriorityFeePerGas: ethers.parseUnits("0.25", "gwei"), 
+                maxFeePerGas: ethers.parseUnits("0.50", "gwei"),
+                nonce: transactionNonce++,
+                type: 2
             }
-        }).catch(() => {});
+        ).then(tx => {
+            const latency = Date.now() - startTime;
+            console.log(`\n💰 [STRIKE SENT] Whale: ${whaleVal.toFixed(2)} ETH | Attack: ${loanAmount} WETH | Latency: ${latency}ms`);
+            console.log(`🔗 [VIEW TX] ${SCANNER_BASE}${tx.hash}`);
 
-    }).catch(err => {
-        if (err.message.includes("nonce")) {
-            provider.getTransactionCount(signer.address, 'pending').then(n => transactionNonce = n);
-        }
-    });
+            tx.wait(1).then(receipt => {
+                if (receipt.status === 1) {
+                    console.log(`✅ [SUCCESS] Won the block. Check WETH balance.`);
+                } else {
+                    console.log(`⚠️  [REVERT] No profit gap or competition beat us.`);
+                }
+            }).catch(() => {});
+
+        }).catch(err => {
+            if (err.message.includes("nonce")) {
+                provider.getTransactionCount(signer.address, 'pending').then(n => transactionNonce = n);
+            }
+        });
+    } catch (e) {}
 }
 
-// 4. SCANNER & PROFIT MONITOR
-function startScanning() {
-    console.log(`🔍 SNIFFER LIVE: ${WSS_URL.substring(0, 30)}...`);
-    const wssProvider = new ethers.WebSocketProvider(WSS_URL);
-    const wethContract = new ethers.Contract(TOKENS.WETH, ABI, provider);
+// 4. NITRO SNIFFER (RAW WEBSOCKET SPEED)
+function startNitroScanner() {
+    console.log(`🔍 SNIFFER LIVE: RAW WEBSOCKET MODE`);
     
-    wssProvider.on("pending", (h) => {
-        provider.getTransaction(h).then(tx => {
-            if (tx) executeApexStrike(tx);
-        }).catch(() => {});
+    // Connects via raw WebSocket for lower latency than the ethers wrapper
+    const ws = new WebSocket(WSS_URL);
+    const wethContract = new ethers.Contract(TOKENS.WETH, ABI, provider);
+
+    ws.on('open', () => {
+        ws.send(JSON.stringify({ 
+            "jsonrpc": "2.0", 
+            "id": 1, 
+            "method": "eth_subscribe", 
+            "params": ["newPendingTransactions"] 
+        }));
     });
 
-    // Heartbeat every 45 seconds to update logs
+    ws.on('message', (data) => {
+        const response = JSON.parse(data);
+        if (response.params && response.params.result) {
+            // response.params.result is the transaction hash
+            executeApexStrike(response.params.result);
+        }
+    });
+
+    // Heartbeat every 45 seconds
     setInterval(async () => {
         try {
             currentGasBalance = await provider.getBalance(signer.address);
-            
-            // Checks for WETH profit stored in the contract
             const wethBal = await wethContract.balanceOf(CONTRACT_ADDR).catch(() => 0n);
-            
-            console.log(`[HEARTBEAT] Gas: ${ethers.formatEther(currentGasBalance).substring(0,6)} | Earned (WETH): ${ethers.formatEther(wethBal).substring(0,7)} | Nonce: ${transactionNonce}`);
-        } catch (e) {
-            console.log("⚠️ Heartbeat lag... still hunting.");
-        }
+            console.log(`[HB] Gas: ${ethers.formatEther(currentGasBalance).substring(0,6)} | Earned (WETH): ${ethers.formatEther(wethBal).substring(0,7)} | Nonce: ${transactionNonce}`);
+        } catch (e) {}
     }, 45000);
 
-    wssProvider.websocket.on("close", () => {
-        console.log("🔄 Reconnecting Sniffer...");
-        setTimeout(startScanning, 2000);
+    ws.on("close", () => {
+        console.log("🔄 Reconnecting Nitro Sniffer...");
+        setTimeout(startNitroScanner, 2000);
     });
 }
 
@@ -172,7 +185,7 @@ app.get('/status', async (req, res) => {
         const wethContract = new ethers.Contract(TOKENS.WETH, ABI, provider);
         const wethBal = await wethContract.balanceOf(CONTRACT_ADDR);
         res.json({ 
-            status: "HUNTING", 
+            status: "NITRO_HUNTING", 
             gas_eth: ethers.formatEther(bal), 
             contract_weth: ethers.formatEther(wethBal) 
         });
@@ -180,5 +193,5 @@ app.get('/status', async (req, res) => {
 });
 
 init().then(() => {
-    app.listen(PORT, () => startScanning());
+    app.listen(PORT, () => startNitroScanner());
 });
